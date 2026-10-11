@@ -1,0 +1,159 @@
+# ===========================================================================
+# 人脸门禁 Demo 配置
+#
+# 这是整个 Demo 的「参数总表」。活体检测的每一路线索都把自己的原始指标和阈值
+# 暴露在这里,运行时界面右侧面板会实时显示当前值与判定结果,方便对照调参。
+#
+# 阈值默认值面向「笔记本内置摄像头 + 室内光照 + 人脸距离 40~80cm」这一常见场景。
+# 换摄像头或换光照后,请先用 `python main.py recognize` 观察面板里的原始数值,
+# 再回来调整对应的 *_fake_below / *_live_above。
+# ===========================================================================
+
+camera:
+  index: 0                  # 摄像头序号(Windows 下 0 通常是内置摄像头)
+  width: 640
+  height: 480
+  fps: 30
+  backend: dshow            # Windows 用 dshow 启动最快、兼容性最好
+  mirror: true              # 镜像显示,像照镜子一样(不影响识别)
+  async_grab: true          # 后台线程持续抓帧,主循环只取最新一帧。
+                            # DirectShow 的 read() 是阻塞的,处理慢时会额外等下一个帧边界,
+                            # 实测把帧率从处理能力的 ~17fps 拖到 ~10fps;开启后帧率由处理速度决定
+  source: null              # 填视频文件路径可改用视频输入,例如 "runs/attack.mp4"
+                            # 这是做「屏幕翻拍 / 视频回放」攻击测试的主要手段
+
+engine:
+  model_pack: buffalo_l     # insightface 官方模型包,首次运行自动下载到 ~/.insightface
+  det_size: [320, 320]      # 检测输入尺寸。320 时检测约 31ms,快路径约 65ms → 15fps 左右;
+                            # 改成 [480,480] 检测升到 63ms(约 9fps),但远处小脸检出率更高。
+                            # 门禁场景人脸通常较近,320 是帧率与检出率的平衡点
+  det_thresh: 0.5
+  intra_op_threads: 4       # ONNX Runtime 单会话线程数。不要设成 CPU 核数:
+                            # 四个模型各自起这么多线程会互相抢核,实测反而慢 8 倍
+  use_liveness_addon: true  # 是否加载 insightface 官方活体模型(80x80 RGB CNN)
+  liveness_threshold: 0.80  # 官方模型自身的判定线,仅作展示,融合时用的是连续分数
+  max_faces: 1              # 门禁场景只处理最靠前的一个人脸
+  recognize_interval_ms: 400  # 慢路径(512维特征提取 ~100ms)的最小重跑间隔。
+                            # 检测/关键点/活体每帧都跑,特征比对按这个节流
+  pose_every_n_frames: 2    # 3D 姿态(27ms)隔几帧算一次,其余帧复用上一帧
+  spectrum_every_n_frames: 2  # FFT 频谱(7ms)隔几帧算一次;摩尔纹是场景级静态属性,隔帧无损
+  perf_profile: balanced    # 性能档:quality(~9fps,最稳) / balanced(~18fps) / fast(~25fps)
+                            # 运行时按 p 键或点工具栏「性能」按钮循环切换,立即生效
+  use_roi_tracking: true    # 锁定人脸后只在人脸周围 ROI 内检测并用更小 det_size,
+                            # 检测耗时从 31ms 降到 ~12ms;校验失败自动回退全帧
+
+liveness:
+  window_sec: 3.0           # 参与判决的滑动时间窗长度
+  min_track_frames: 12      # 累计到这么多帧才给出第一次判决,之前输出「观察中」
+  decision_threshold: 0.50  # 融合分 >= 此值判为活体
+  confirm_frames: 5         # 连续这么多帧同向才切换判决,抑制单帧抖动
+  track_reset_frames: 10    # 连续丢失人脸这么多帧后清空轨迹重新开始
+
+  # -------------------------------------------------------------------------
+  # 七路线索的开关 / 融合权重 / 一票否决线
+  #
+  #   weight      融合时的加权系数,0 等于关闭该线索
+  #   veto_below  该线索得分低于此值且置信度足够时,直接判「非活体」,
+  #               不再看加权总分。用于「一旦命中就几乎不可能是真人」的强线索
+  #   score 语义  0 = 确定是攻击载体,1 = 确定是真人,None = 证据不足(不计入融合)
+  # -------------------------------------------------------------------------
+  cues:
+    deep_model:   { enabled: true, weight: 1.6, veto_below: 0.08 }  # insightface 官方 CNN
+    blink:        { enabled: true, weight: 1.2, veto_below: null }   # 自然眨眼
+    micro_motion: { enabled: true, weight: 0.9, veto_below: null }   # 生理性微颤
+    planarity:    { enabled: true, weight: 1.4, veto_below: null }   # 单应残差 / 三维视差
+    texture:      { enabled: true, weight: 0.6, veto_below: null }   # 高频纹理能量
+    moire:        { enabled: true, weight: 1.0, veto_below: 0.20 }   # 屏幕摩尔纹
+    color:        { enabled: true, weight: 0.4, veto_below: null }   # 色偏与饱和度
+
+  blink:
+    # EAR(眼睛纵横比)相对该轨迹的基线跌到多少比例,算一次闭眼
+    ear_close_ratio: 0.55
+    min_blinks: 1           # 观察窗内至少需要几次眨眼
+    window_sec: 6.0         # 眨眼统计窗。人平均 3~5 秒眨一次,窗太短会误判
+
+  micro_motion:
+    # 运动存在性 + 运动合理性。这一路专门抓「完全静止」的载体:静置的打印照片、
+    # 暂停的视频回放,它们的全局位移和非刚性形变都趋近于 0。
+    # 注意:手持照片晃动时这一路会通过,靠 planarity 那一路去拦。
+    motion_static_below: 0.0008  # 帧间质心位移(瞳距占比)低于此 → 视为冻结
+    motion_live_above: 0.0040    # 高于此 → 运动充分
+    jitter_calm_above: 2.0       # 帧间姿态角变化(度)超过此值开始扣分
+    jitter_violent_above: 8.0    # 超过此值判为剧烈晃动(手持屏幕/视频快进)
+    deform_fake_below: 0.006     # 去掉全局相似变换后的残差(瞳距占比)
+    deform_live_above: 0.030     # 真人眨眼/说话/三维转动会留出明显非刚性形变
+
+  planarity:
+    # ★ 单目三维结构线索:打印照片和屏幕都是平面,刚性运动下其图像变换严格等于
+    #   一个单应矩阵;真实人脸是非平面三维体,转动时关键点位移场无法被单应解释,
+    #   残差会显著更大(鼻部、眼窝、下颌最明显)。
+    #
+    # 下面两个阈值由 `python main.py selftest` 实测标定:
+    #   平面载体(已知单应变换 + 真实关键点模型)残差 0.002~0.005 瞳距,内点率 1.00
+    #   三维人脸(几何验证,25~35 度转头)          残差 0.042~0.048 瞳距
+    # 分离度约 10 倍。换摄像头后请重跑 selftest 重新标定。
+    reference_age_sec: 0.6  # 参考帧取多久之前的,太近则位移太小、残差被噪声淹没
+    require_motion_norm: 0.08  # 归一化位移量低于此值说明头没动,线索输出 None(不参与融合)
+    residual_fake_below: 0.012  # 残差(以瞳距为单位)低于此 → 判为平面载体
+    residual_live_above: 0.042  # 高于此 → 判为三维实体;两者之间线性过渡
+    ransac_reproj_px: 3.0
+
+  texture:
+    # 屏幕翻拍经过「显示 → 再拍摄」两次采样,加上压缩,高频细节被抹平
+    laplacian_fake_below: 35.0   # 对齐人脸上 Laplacian 方差
+    laplacian_live_above: 90.0
+    band_ratio_fake_below: 0.10  # FFT 高频带 / 低频带能量比
+    band_ratio_live_above: 0.28
+
+  moire:
+    # 屏幕像素栅格在频域会产生孤立、尖锐、能量极高的周期性峰值,这是翻拍最强的
+    # 单帧证据。面板里会把幅度谱画出来并圈出检出的峰。
+    peak_ratio_fake_above: 6.0   # 峰值 / 中频带中位数,高于此 → 疑似屏幕
+    peak_ratio_live_below: 3.0
+    min_peaks: 3                 # 至少要检出这么多孤立峰才认定
+    low_freq_keep: 6             # 屏蔽频谱中心这么多个 bin(去掉 DC 与低频)
+
+  color:
+    # 屏幕有背光色偏(通常偏冷)、饱和度偏高;打印照片偏灰、饱和度低。
+    # 这一路受白平衡影响大,只给很小的权重。
+    sat_fake_above: 0.42
+    sat_live_below: 0.30
+    skin_hue_lo: 3            # OpenCV HSV 的 H 取值 0~179,肤色大致落在这个区间
+    skin_hue_hi: 25
+    skin_ratio_fake_below: 0.35   # 肤色像素占比过低 → 可能是屏幕/纸张
+
+gate:
+  accept_threshold: 0.42      # 余弦相似度 >= 此值 → 是本人,开门
+                              # ArcFace 同一人通常 0.45~0.75,不同人 < 0.25
+  stranger_threshold: 0.16    # 低于此值 → 视为「未录入」而不是「不是本人」
+  cooldown_sec: 3.0           # 一次开门后多久内不再重复触发
+  open_hold_sec: 2.0          # 「开门」状态在界面上停留多久
+
+gallery:
+  dir: data/gallery           # ★ 人脸库存储位置(相对项目根目录)
+                              #   index.json      人员索引与元数据
+                              #   <id>.npz        该人的 N 条 512 维特征 + 质量指标
+                              #   <id>_thumb.jpg  缩略图
+  samples_per_person: 5       # 每人采集几条样本。多姿态样本能显著提升召回
+  min_det_score: 0.65
+  require_live: true          # 录入时也必须通过活体检测,否则照片就能进库
+  max_pairwise_sim: 0.92      # 新样本与已有样本相似度高于此值则丢弃(姿态重复,无信息量)
+  min_face_px: 90             # 人脸框短边小于此像素不采集,特征质量太差
+
+viz:
+  enabled: true
+  panel_width: 570            # 右侧调试面板列宽
+  show_landmarks: true        # 主画面叠加 106 点关键点
+  show_pose_axis: true        # 叠加三维姿态轴(pitch/yaw/roll)
+  show_homography: true       # 叠加「单应预测点 vs 实际点」残差连线 ← 平面性线索可视化
+  show_eye_axis: true         # 叠加眼部主轴与 EAR 张口量
+  waveform_seconds: 8.0       # 时序波形面板显示多少秒
+  font: null                  # 中文字体路径,null = 自动在 C:/Windows/Fonts 下找
+  font_size: 15
+  snapshot_dir: runs/snapshots
+
+log:
+  dir: runs
+  level: INFO
+  metrics_csv: true           # 把每帧的全部原始指标写到 runs/metrics_<时间戳>.csv,
+                              # 方便自己拉数据画分布、重新标定阈值

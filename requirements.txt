@@ -1,0 +1,8 @@
+insightface==2.1
+onnxruntime>=1.20
+opencv-python>=4.10
+numpy>=1.26
+scipy>=1.11
+PyYAML>=6.0
+prettytable>=3.9
+Pillow>=10.0
